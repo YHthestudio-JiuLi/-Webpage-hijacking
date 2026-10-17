@@ -243,14 +243,3 @@ A: 不能。JS 层面无法拦截未暴露到可控对象上的引用。但闭�
 text
 
 ---
-
-## 配套 `.gitignore`（如果还没有）
-
-```gitignore
-node_modules/
-chrome-profile/
-chrome-profile.bak/
-logs/
-screenshots/
-.env
-*.log
