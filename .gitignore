@@ -1,0 +1,8 @@
+node_modules/
+chrome-profile/
+chrome-profile.bak/
+logs/
+screenshots/
+cs
+.env
+*.log

@@ -1,0 +1,65 @@
+{
+  "targetUrl": "",
+  "username": "",
+  "password": "",
+  "selectors": {
+    "username": "#username",
+    "password": "#userTypePwd",
+    "submit": "#loginBtn"
+  },
+  "loggedInSelectors": [
+    "text=退出",
+    "text=开始"
+  ],
+  "keepOpen": true,
+  "userDataDir": "./chrome-profile",
+  "clickTimeout": 8000,
+  "autoHandleDialogs": true,
+  "autoRemoveModal": true,
+  "autoClickFullscreen": false,
+  "fullscreen": false,
+  "hideInfobar": true,
+  "interceptLeaveRequests": true,
+  "leaveKeywords": [
+    "leave",
+    "unload",
+    "visibility",
+    "blur",
+    "focus",
+    "hidden",
+    "switch",
+    "exit"
+  ],
+  "incidentFnNames": [
+    "VisibilityStateEntry",
+    "SVGSwitchElement",
+    "SVGFEGaussianBlurElement",
+    "FocusEvent",
+    "ContentVisibilityAutoStateChangeEvent",
+    "BeforeUnloadEvent",
+    "blur",
+    "focus",
+    "XRVisibilityMaskChangeEvent",
+    "switchLang",
+    "switchBtnFn",
+    "switchVideoStatus",
+    "setSwitchScreenCookie",
+    "blurCount",
+    "clearBlurCountTimerFn",
+    "checkSwitchScreenCookie",
+    "startBlurCount",
+    "stopBlurCount"
+  ],
+  "incidentEventTypes": [
+    "beforeunload",
+    "unload",
+    "visibilitychange",
+    "pagehide"
+  ],
+  "incidentObjectMethods": [
+    {
+      "owner": "screenfull",
+      "name": "exit"
+    }
+  ]
+}
