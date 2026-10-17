@@ -13,11 +13,21 @@ function stripBOM(s) {
 const DEFAULT_SELECTORS = { username: '#username', password: '#userTypePwd', submit: '#loginBtn' };
 const DEFAULT_LOGGED_IN = ['text=退出', 'text=开始'];
 const DEFAULT_EVENT_TYPES = ['beforeunload', 'unload', 'visibilitychange', 'pagehide'];
+const DEFAULT_LEAVE_KEYWORDS = ['leave', 'unload', 'visibility', 'pagehide', 'beforeunload'];
+const IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+function keywordList(value, fallback) {
+  if (!Array.isArray(value)) return fallback.slice();
+  // 只保留非空字符串，避免数字或对象在 toLowerCase 时抛错
+  return value.filter(item => typeof item === 'string' && item.length > 0);
+}
 
 function loadConfig() {
   const p = path.join(__dirname, 'config.json');
   if (!fs.existsSync(p)) throw new Error('缺少 config.json');
   const raw = JSON.parse(stripBOM(fs.readFileSync(p, 'utf8')));
+  const leaveKeywords = keywordList(raw.leaveKeywords, DEFAULT_LEAVE_KEYWORDS);
+  const hasInterceptKeywords = Object.prototype.hasOwnProperty.call(raw, 'interceptKeywords');
 
   return {
     targetUrl: process.env.SITE_URL  || raw.targetUrl || '',
@@ -37,7 +47,9 @@ function loadConfig() {
     clickTimeout: typeof raw.clickTimeout === 'number' ? raw.clickTimeout : 8000,
 
     interceptLeaveRequests: raw.interceptLeaveRequests !== false,
-    leaveKeywords:   Array.isArray(raw.leaveKeywords)   ? raw.leaveKeywords.filter(Boolean)   : [],
+    leaveKeywords,
+    interceptKeywords: hasInterceptKeywords ? keywordList(raw.interceptKeywords, []) : leaveKeywords.slice(),
+    interceptKeywordsLegacy: !hasInterceptKeywords,
     incidentFnNames: Array.isArray(raw.incidentFnNames) ? raw.incidentFnNames.filter(Boolean) : [],
 
     incidentEventTypes: Array.isArray(raw.incidentEventTypes)
@@ -54,37 +66,15 @@ function loadConfig() {
 
 const CONFIG = loadConfig();
 
-// ======================== 写回 config.json ========================
-// 读原始 raw 而非 CONFIG（避免环境变量里的账号密码落盘）
-function saveIncidentFnsAndMethods(newFns, newMethods) {
-  const p = path.join(__dirname, 'config.json');
-  const raw = JSON.parse(stripBOM(fs.readFileSync(p, 'utf8')));
-
-  const oldFns = Array.isArray(raw.incidentFnNames) ? raw.incidentFnNames : [];
-  const oldM   = Array.isArray(raw.incidentObjectMethods) ? raw.incidentObjectMethods : [];
-  const keyOf  = m => m.owner + '::' + m.name;
-
-  const addedFns = newFns.filter(n => n && !oldFns.includes(n));
-  const existingKeys = new Set(oldM.map(keyOf));
-  const addedM = newMethods.filter(m => m && !existingKeys.has(keyOf(m)));
-
-  const mergedFns = Array.from(new Set([...oldFns, ...newFns].filter(Boolean)));
-  const mergedM = [...oldM];
-  newMethods.forEach(m => { if (!existingKeys.has(keyOf(m))) { mergedM.push(m); existingKeys.add(keyOf(m)); } });
-
-  raw.incidentFnNames = mergedFns;
-  raw.incidentObjectMethods = mergedM;
-  fs.writeFileSync(p, JSON.stringify(raw, null, 2) + '\n', 'utf8');
-
-  const added = [...addedFns, ...addedM.map(m => m.owner + '.' + m.name)];
-  return { merged: mergedFns, added, mergedM };
-}
-
 // ======================== 补丁生成 ========================
 // 内部代码不使用模板字面量，避免与外层模板字符串的 ${} 冲突
-function buildAntiPatch(cfg) {
+function buildAntiPatch(cfg, generation) {
   return `
 (function(){
+  const generation = ${generation};
+  if (generation < (window.__antiPatchGeneration__ || 0)) return;
+  window.__antiPatchGeneration__ = generation;
+
   // ---- 0. 清理上一份补丁 ----
   const oldCleanup = window.__antiPatchCleanup__;
   window.__antiPatchCleanup__ = null;
@@ -109,7 +99,7 @@ function buildAntiPatch(cfg) {
   // 只做 stopImmediatePropagation，不调用 preventDefault：
   //   - preventDefault 在 pagehide 上会破坏往返缓存（bfcache）
   //   - preventDefault 在 blur/focusout/freeze 上无意义
-  const stopFn = function(e){ try { e.stopImmediatePropagation(); } catch(_) {} return true; };
+  const stopFn = function(e){ try { e.stopImmediatePropagation(); } catch(_) {} };
   [W, D].forEach(function(el){
     kill.forEach(function(ev){
       try {
@@ -144,13 +134,23 @@ function buildAntiPatch(cfg) {
 
   // ---- 3. window 顶层函数替换（incidentFnNames）----
   const fnNames = ${JSON.stringify(cfg.incidentFnNames)};
+  const fnNameSet = new Set(fnNames);
+  const owned = new WeakSet();
+  const originals = new WeakMap();
   const wrapFns = function(){
-    fnNames.forEach(function(n){
+    fnNameSet.forEach(function(n){
       try {
-        const f = W[n];
-        if (typeof f === 'function' && !f.__kill__) {
+        let f = W[n];
+        if (owned.has(f)) {
+          const saved = originals.get(f);
+          if (!saved || saved.name === n) return;
+          // 包装函数被挪到别的名字上时，先解回原函数，再为当前名字单独包一层
+          f = saved.original;
+        }
+        if (typeof f === 'function' && !owned.has(f)) {
           const wrapper = function(){ try { console.log('已拦截函数:', n); } catch(_) {} };
-          wrapper.__kill__ = true;
+          owned.add(wrapper);
+          originals.set(wrapper, { name: n, original: f });
           W[n] = wrapper;
         }
       } catch(_) {}
@@ -158,14 +158,21 @@ function buildAntiPatch(cfg) {
   };
   wrapFns();
   const wrapTimer = setInterval(wrapFns, 300);
-  cleanups.push(function(){ clearInterval(wrapTimer); });
+  cleanups.push(function(){
+    clearInterval(wrapTimer);
+    fnNameSet.forEach(function(n){
+      try {
+        const saved = originals.get(W[n]);
+        if (saved && saved.name === n) W[n] = saved.original;
+      } catch(_) {}
+    });
+  });
 
   // ---- 4. addEventListener / removeEventListener 原型劫持 ----
   if (eventTypes.length) {
     try {
       const origAdd = EventTarget.prototype.addEventListener;
       const origRemove = EventTarget.prototype.removeEventListener;
-      // 记录 原函数 -> Set<wrapper>，保证 remove 能匹配到 wrapper
       const wrapperMap = new WeakMap();
 
       const hookedAdd = function(type, fn, opts) {
@@ -205,7 +212,6 @@ function buildAntiPatch(cfg) {
         return origRemove.call(this, type, fn, opts);
       };
 
-      // 打标记供 diagnose 检测（不依赖 toString，因为下面做了 native 伪装）
       try { hookedAdd.__hooked__ = true; } catch(_) {}
       try { hookedAdd.toString    = function(){ return 'function addEventListener() { [native code] }'; }; } catch(_) {}
       try { hookedRemove.toString = function(){ return 'function removeEventListener() { [native code] }'; }; } catch(_) {}
@@ -249,9 +255,10 @@ function buildAntiPatch(cfg) {
   // ---- 6. 弹窗移除 ----
   if (${cfg.autoRemoveModal}) {
     try {
+      // 用 textContent 而非 innerText：innerText 每次访问触发强制重排，DOM 大时严重卡顿
       const closeModal = function(){
         [].slice.call(D.querySelectorAll('div,section')).forEach(function(n){
-          const t = (n.innerText || '');
+          const t = (n.textContent || '');
           if ((t.indexOf('yh') !== -1 || t.indexOf('离开页面') !== -1 || t.indexOf('请勿切换') !== -1) && t.length < 300) {
             const box = n.closest('.modal,.el-dialog,.ant-modal,[class*="modal"],[class*="dialog"]') || n;
             if (box && box.parentNode) { box.parentNode.removeChild(box); console.log('已移除yh弹窗'); }
@@ -276,7 +283,7 @@ function buildAntiPatch(cfg) {
     W.__antiPatchCleanup__ = null;
   };
 
-  console.log('[防yh] 补丁已注入 | 函数:', fnNames.length,
+  console.log('[防yh] 补丁已注入 | 函数:', fnNameSet.size,
     '| 事件类型:', eventTypes.length,
     '| 对象方法:', objMethods.length,
     '| 弹窗清理:', ${cfg.autoRemoveModal});
@@ -357,18 +364,19 @@ async function pressF11(page) {
   try { await page.keyboard.press('F11'); console.log('✓ 已发送 F11'); } catch (_) {}
 }
 
-// ======================== 扫描 ========================
-async function scanAndSave(page) {
-  const empty = { merged: CONFIG.incidentFnNames.slice(), added: [], mergedM: CONFIG.incidentObjectMethods.slice() };
-
+// ======================== 扫描（只展示，不写入）========================
+async function scanLeaveFns(page) {
   const kws = CONFIG.leaveKeywords;
-  if (!kws.length) { console.log('⚠ leaveKeywords 为空'); return empty; }
-  if (page.isClosed()) { console.log('✗ 页面已关闭，无法扫描'); return empty; }
+  if (!kws.length) { console.log('⚠ leaveKeywords 为空，无法扫描'); return; }
+  if (page.isClosed()) { console.log('✗ 页面已关闭，无法扫描'); return; }
 
   const r = await page.evaluate((words) => {
     const lower = words.map(w => w.toLowerCase());
     const hits = [];
-    const seen = new WeakSet();
+    const seenSafe = new WeakMap();
+    const seenUnsafe = new WeakMap();
+    const ident = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+    const maxDepth = 2;
 
     const SKIP = new Set([
       'window','self','top','parent','frames','globalThis',
@@ -377,12 +385,28 @@ async function scanAndSave(page) {
       'console','performance','caches','speechSynthesis',
     ]);
 
-    function match(k) { return lower.some(w => k.toLowerCase().indexOf(w) !== -1); }
+    function matchKeys(k) {
+      const lk = k.toLowerCase();
+      return lower.filter(w => lk.indexOf(w) !== -1);
+    }
+
+    function pathSafe(segments) {
+      for (let i = 1; i < segments.length; i++) {
+        if (!ident.test(segments[i])) return false;
+      }
+      return true;
+    }
 
     function walk(obj, path, depth) {
       if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) return;
-      if (seen.has(obj)) return;
-      try { seen.add(obj); } catch(_) {}
+      // 按安全类别记录已走过的最大剩余深度。更深的路径不能挡住更浅的别名
+      const safe = pathSafe(path);
+      const seen = safe ? seenSafe : seenUnsafe;
+      const remain = maxDepth - depth;
+      let prev;
+      try { prev = seen.get(obj); } catch (_) { prev = undefined; }
+      if (prev !== undefined && prev >= remain) return;
+      try { seen.set(obj, remain); } catch (_) {}
       let keys;
       try { keys = Object.getOwnPropertyNames(obj); } catch(_) { return; }
       for (const k of keys) {
@@ -391,62 +415,167 @@ async function scanAndSave(page) {
         if (k === 'constructor' || k === 'prototype') continue;
         let v;
         try { v = obj[k]; } catch(_) { continue; }
-        const full = path ? (path + '.' + k) : k;
+        const next = path.concat(k);
         const vt = typeof v;
-        if (match(k) && (vt === 'function' || vt !== 'object')) {
-          hits.push({ path: full, key: k, owner: path, type: vt });
+        const matched = matchKeys(k);
+        // 只收集 function 类型，避免 string/number 等噪音
+        if (matched.length && vt === 'function') {
+          hits.push({ segments: next, matched: matched });
         }
-        if (depth < 2 && v && vt === 'object' && !Array.isArray(v)) {
-          walk(v, full, depth + 1);
+        if (depth < maxDepth && v && vt === 'object' && !Array.isArray(v)) {
+          walk(v, next, depth + 1);
         }
       }
     }
-    walk(window, 'window', 0);
+    walk(window, ['window'], 0);
     return hits;
   }, kws);
 
-  console.log('扫描结果:', JSON.stringify(r, null, 2));
-
-  const topFns = r.filter(x => x.owner === 'window' && x.type === 'function').map(x => x.key);
-  const objFns = r.filter(x => x.owner && x.owner !== 'window' && x.type === 'function')
-                  .map(x => ({ owner: x.owner.replace(/^window\./, ''), name: x.key }));
-
-  if (!topFns.length && !objFns.length) { console.log('未发现可拦截的 function'); return empty; }
-
-  let result;
-  try {
-    result = saveIncidentFnsAndMethods(topFns, objFns);
-  } catch (e) {
-    console.log('✗ 写入 config.json 失败:', e.message);
-    return empty;
+  if (!r.length) {
+    console.log('未发现 function 类型的匹配项（关键词可能太窄，或页面尚未加载完）');
+    return;
   }
 
-  CONFIG.incidentFnNames = result.merged;
-  CONFIG.incidentObjectMethods = result.mergedM;
+  const generic = new Set(['focus', 'blur', 'hidden', 'switch', 'exit']);
+  const topFns = [];
+  const objMethods = [];
+  const weakHits = [];
+  const unsupported = [];
+  for (const hit of r) {
+    const name = hit.segments[hit.segments.length - 1];
+    const ownerParts = hit.segments.slice(1, -1);
+    const shown = formatPath(hit.segments);
+    const weak = hit.matched.every(word => generic.has(word));
+    if (ownerParts.some(part => !IDENTIFIER.test(part))) {
+      unsupported.push(shown);
+      continue;
+    }
+    if (weak) {
+      weakHits.push(shown);
+      continue;
+    }
+    if (!ownerParts.length) topFns.push(name);
+    else objMethods.push({ owner: ownerParts.join('.'), name });
+  }
 
-  if (result.added.length) console.log('✓ 本次新增:', result.added.join(', '));
-  else console.log('✓ 扫描结果已全部存在，无新增');
-  console.log('✓ incidentFnNames:', result.merged.join(', ') || '空');
-  console.log('✓ incidentObjectMethods:', result.mergedM.map(m => m.owner + '.' + m.name).join(', ') || '空');
-  console.log('输入 r 热更新生效（或 a 一步完成扫描+加入+热更新）');
-  return result;
+  console.log(`\n扫描结果 (${r.length} 个 function)。下面是可粘贴 JSON，把两个数组抄进 config.json 后按 r。`);
+  console.log(JSON.stringify({ incidentFnNames: topFns, incidentObjectMethods: objMethods }, null, 2));
+  if (weakHits.length) {
+    console.log('\n以下只匹配了泛词 focus/blur/hidden/switch/exit，未放进 JSON：');
+    weakHits.forEach(item => console.log('  - ' + item));
+  }
+  if (unsupported.length) {
+    console.log('\n以下属性名不能按点路径访问，未放进 JSON：');
+    unsupported.forEach(item => console.log('  - ' + item));
+  }
+  console.log('');
+}
+
+function formatPath(segments) {
+  return segments.map((part, index) => {
+    if (index === 0) return part;
+    return IDENTIFIER.test(part) ? '.' + part : '[' + JSON.stringify(part) + ']';
+  }).join('');
 }
 
 // ======================== 热更新 ========================
+let patchGeneration = 0;
+let patchScript = null;
+let interceptRouted = false;
+const INTERCEPT_PATTERN = '**/*';
+
+function nextPatch(cfg) {
+  patchGeneration += 1;
+  return buildAntiPatch(cfg, patchGeneration);
+}
+
+async function installInitPatch(context, patch) {
+  const nextScript = await context.addInitScript(patch);
+  const prevScript = patchScript;
+  patchScript = nextScript;
+  if (!prevScript) return;
+  try { await prevScript.dispose(); } catch (_) {}
+}
+
+function interceptActive(cfg) {
+  return cfg.interceptLeaveRequests && cfg.interceptKeywords.length > 0;
+}
+
+function reportInterceptPolicy() {
+  if (!CONFIG.interceptLeaveRequests) return;
+  if (CONFIG.interceptKeywordsLegacy) {
+    console.log('⚠ config.json 没有 interceptKeywords，请求拦截暂时沿用 leaveKeywords。请把 URL 关键词单独写到 interceptKeywords。');
+  }
+  if (!CONFIG.interceptKeywords.length) console.log('⚠ interceptKeywords 为空，未注册请求拦截');
+}
+
+function interceptRequest(route) {
+  if (!interceptActive(CONFIG)) return route.continue();
+  const req = route.request();
+  const type = req.resourceType();
+  if (type !== 'xhr' && type !== 'fetch') return route.continue();
+  const url = req.url().toLowerCase();
+  const hit = CONFIG.interceptKeywords.some(keyword => url.includes(keyword.toLowerCase()));
+  if (!hit) return route.continue();
+  console.log('拦截:', req.url().slice(0, 90));
+  return route.abort('blockedbyclient');
+}
+
+async function syncInterceptRoute(context, cfg) {
+  const shouldRoute = interceptActive(cfg);
+  if (shouldRoute === interceptRouted) return;
+  if (!shouldRoute) {
+    try {
+      await context.unroute(INTERCEPT_PATTERN, interceptRequest);
+      interceptRouted = false;
+    } catch (e) {
+      try {
+        await context.route(INTERCEPT_PATTERN, interceptRequest);
+        interceptRouted = true;
+      } catch (_) {
+        interceptRouted = false;
+      }
+      throw e;
+    }
+    return;
+  }
+  try {
+    await context.route(INTERCEPT_PATTERN, interceptRequest);
+    interceptRouted = true;
+  } catch (e) {
+    try { await context.unroute(INTERCEPT_PATTERN, interceptRequest); } catch (_) {}
+    interceptRouted = false;
+    throw e;
+  }
+}
+
 async function hotReload(context) {
-  Object.assign(CONFIG, loadConfig());
-  const patch = buildAntiPatch(CONFIG);
+  const nextConfig = loadConfig();
+  // 路由先按下一份配置切换成功，再发布新补丁，避免失败时新一代补丁已经在页面上跑起来
+  await syncInterceptRoute(context, nextConfig);
+  Object.assign(CONFIG, nextConfig);
+  reportInterceptPolicy();
+  const patch = nextPatch(nextConfig);
+  await installInitPatch(context, patch);
 
   let ok = 0;
+  const failed = [];
   for (const p of context.pages()) {
     if (p.isClosed()) continue;
-    try { await p.evaluate(patch); ok++; } catch (_) {}
+    try {
+      await p.evaluate(patch);
+      ok += 1;
+    } catch (e) {
+      failed.push(p.url() + ': ' + e.message);
+    }
   }
-  // addInitScript 会累积，但补丁开头会自动调用上一份的 cleanup，最终只有最新生效
-  await context.addInitScript(patch);
-  await applyRoute(context);
 
-  console.log('✓ 热更新完成 | 已刷新:', ok,
+  if (failed.length) {
+    console.log('✗ 热更新未全部完成 | 已注入:', ok, '| 失败:', failed.length);
+    failed.forEach(line => console.log('  - ' + line));
+    return;
+  }
+  console.log('✓ 热更新完成 | 已注入:', ok,
     '| 函数:', CONFIG.incidentFnNames.length,
     '| 事件:', CONFIG.incidentEventTypes.length,
     '| 对象方法:', CONFIG.incidentObjectMethods.length);
@@ -493,43 +622,42 @@ async function launchBrowser() {
   throw new Error('未找到可用浏览器');
 }
 
-async function applyRoute(context) {
-  try { await context.unrouteAll({ behavior: 'ignoreErrors' }); }
-  catch (_) { try { await context.unroute('**/*'); } catch (_) {} }
-
-  if (!CONFIG.interceptLeaveRequests) return;
-
-  const kws = CONFIG.leaveKeywords.map(k => k.toLowerCase());
-  await context.route('**/*', route => {
-    const req = route.request();
-    const type = req.resourceType();
-    if (type !== 'xhr' && type !== 'fetch') return route.continue();
-    const url = req.url().toLowerCase();
-    if (kws.some(k => url.includes(k))) {
-      console.log('拦截:', req.url().slice(0, 90));
-      route.abort('blockedbyclient');
-    } else route.continue();
-  });
-}
-
 // ======================== 主流程 ========================
 (async () => {
   let context, page;
   try {
     context = await launchBrowser();
-    await context.addInitScript(buildAntiPatch(CONFIG));
+    await installInitPatch(context, nextPatch(CONFIG));
+    await syncInterceptRoute(context, CONFIG);
+    reportInterceptPolicy();
 
     const pages = context.pages();
     page = pages.find(p => !p.isClosed()) || await context.newPage();
 
-    // 用 WeakSet 保证每个页面只绑定一次监听器（避免 newPage 时重复注册）
+    // 用 WeakSet 保证每个页面只绑定一次监听器
     const boundPages = new WeakSet();
+    let browserGone = false;
+    // 浏览器窗口被关掉时，结束 node，快捷键进程会跟着退出
+    const stopBecauseBrowserClosed = () => {
+      if (browserGone) return;
+      browserGone = true;
+      process.exit(0);
+    };
+    context.on('close', stopBecauseBrowserClosed);
+    const browser = context.browser();
+    if (browser) browser.on('disconnected', stopBecauseBrowserClosed);
+
     const bindPage = (p) => {
       if (boundPages.has(p)) return;
       boundPages.add(p);
 
       if (CONFIG.autoHandleDialogs) {
-        p.on('dialog', d => { console.log('弹窗:', d.message().slice(0, 80)); d.dismiss().catch(() => {}); });
+        p.on('dialog', d => {
+          console.log('弹窗:', d.message().slice(0, 80));
+          // beforeunload 上 accept 才会离开页面；其余弹窗仍关闭
+          const done = d.type() === 'beforeunload' ? d.accept() : d.dismiss();
+          done.catch(() => {});
+        });
       }
       p.on('console', m => {
         const t = m.text();
@@ -537,7 +665,14 @@ async function applyRoute(context) {
         const safe = t.replace(/(token|password|pwd|authorization)\s*[:=]\s*\S+/gi, '$1=***');
         console.log('[页面] ' + safe);
       });
-      p.on('close', () => console.log('页面被关闭'));
+      p.on('close', () => {
+        console.log('页面被关闭');
+        const stillOpen = context.pages().some(item => !item.isClosed());
+        if (stillOpen || browserGone) return;
+        browserGone = true;
+        // 只剩这个页面时，关掉浏览器进程再退出，避免窗口空转
+        context.close().catch(() => {}).finally(() => process.exit(0));
+      });
     };
 
     context.on('page', async p => {
@@ -548,12 +683,11 @@ async function applyRoute(context) {
     });
 
     bindPage(page);
-    await applyRoute(context);
 
     await autoLogin(page);
     if (CONFIG.autoClickFullscreen) await enableClickFullscreen(page);
 
-    console.log('指令：回车=状态 | s=扫描并自动加入 | a=扫描+加入+热更新 | r=热更新 | f=F11 | d=诊断 | q=退出');
+    console.log('指令：回车=状态 | s=扫描 | r=热更新 | f=F11 | d=诊断 | q=退出');
 
     if (CONFIG.keepOpen) {
       const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -576,12 +710,7 @@ async function applyRoute(context) {
             return;
           }
           else if (cmd === 'd') await diagnose(page);
-          else if (cmd === 's') await scanAndSave(page);
-          else if (cmd === 'a') {
-            const { added } = await scanAndSave(page);
-            if (added.length) await hotReload(context);
-            else console.log('无新增，未触发热更新');
-          }
+          else if (cmd === 's') await scanLeaveFns(page);
           else if (cmd === 'r') await hotReload(context);
           else if (cmd === 'f') await pressF11(page);
           else console.log('URL:', page.url(), '| hidden:', await page.evaluate(() => document.hidden).catch(() => '-'));

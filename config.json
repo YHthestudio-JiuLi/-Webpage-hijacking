@@ -19,36 +19,19 @@
   "autoClickFullscreen": false,
   "fullscreen": false,
   "hideInfobar": true,
-  "interceptLeaveRequests": true,
+  "interceptLeaveRequests": false,
   "leaveKeywords": [
     "leave",
     "unload",
     "visibility",
-    "blur",
-    "focus",
-    "hidden",
-    "switch",
-    "exit"
+    "pagehide",
+    "beforeunload",
+    "beforeunload"
   ],
+  "interceptKeywords": [],
   "incidentFnNames": [
     "VisibilityStateEntry",
-    "SVGSwitchElement",
-    "SVGFEGaussianBlurElement",
-    "FocusEvent",
-    "ContentVisibilityAutoStateChangeEvent",
-    "BeforeUnloadEvent",
-    "blur",
-    "focus",
-    "XRVisibilityMaskChangeEvent",
-    "switchLang",
-    "switchBtnFn",
-    "switchVideoStatus",
-    "setSwitchScreenCookie",
-    "blurCount",
-    "clearBlurCountTimerFn",
-    "checkSwitchScreenCookie",
-    "startBlurCount",
-    "stopBlurCount"
+    "blurCount"
   ],
   "incidentEventTypes": [
     "beforeunload",
